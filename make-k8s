@@ -1,0 +1,31 @@
+#!/bin/bash 
+# Compile k8s components 
+
+if [ -z $3 ] ; then
+    echo "Usage: make-k8s <build-type> <version-no> <cloud-provider>, build-type is either basic or federation"
+    exit 1
+fi
+
+if [ -z $K8SPATH ] ; then
+    echo "Usage: please set env K8SPATH to be your local k8s root directory"
+    exit 1
+fi
+
+build_type=$1
+version_no=$2
+cloud_provider=$3
+
+export KUBE_GIT_VERSION=$version_no
+export KUBERNETES_PROVIDER=$cloud_provider
+
+if [ $build_type = "basic" ];then
+    cd $K8SPATH
+    make quick-release 
+    ls -l ./_output/release-tars
+fi
+
+if [ $build_type = "federation" ];then
+    cd $K8SPATH/federation
+    make build_image 
+    docker images | grep federation
+fi

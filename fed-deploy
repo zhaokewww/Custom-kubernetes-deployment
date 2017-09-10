@@ -1,0 +1,216 @@
+#!/bin/bash 
+# Deploy k8s fed components
+# Pre-condition is local cluster is up and running, and we run this script on its master 
+
+if [ -z $3 ] ; then
+    echo "Usage: fed-deploy <federation-name> <zone-name> <your-passwd> <k8s-version-no>"
+    exit 1
+fi
+
+if [ -z $K8SPATH ] ; then
+    echo "Usage: please set env K8SPATH to be your local k8s root directory"
+    exit 1
+fi
+
+federation_name=$1
+zone_name=$2
+passwd=$3
+version_no=$4
+
+echo "Clean up and reinstall images..."
+
+# Replace fed image
+docker rmi gcr.io/google_containers/hyperkube-amd64:$version_no
+docker tag localhost:5000/federation/hyperkube-amd64:$(docker images | grep federation | awk '{ print $2}') gcr.io/google_containers/hyperkube-amd64:$version_no
+
+# Parse k8s admin.conf, to get API server
+ADMINCONFIG=$HOME/admin.conf
+if [ ! -f $ADMINCONFIG ]; then
+    echo "Usage: please run master-deploy firstly, to create local cluster"
+    exit 1
+fi
+RAW_URL=""
+LINE=""
+N=0
+NUM=$(cat $ADMINCONFIG |wc -l)
+getline() {  N=$(expr $N + 1); LINE=$(sed -n ${N}p $ADMINCONFIG); }
+while [ $N -le $NUM ]
+do
+	getline
+	case $LINE in 
+	"- cluster:")
+		getline; TMP_CA="$LINE"
+		getline; TMP_SERVER="$LINE"
+		getline; TMP_NAME="$LINE"
+		NEED=$(echo $TMP_NAME |grep "kubernetes")
+		if [ -n "$NEED" ]; then
+			RAW_URL="$TMP_SERVER"
+		fi
+		;;
+	*) ;;
+	esac
+done
+
+API_SERVER_URL=$(echo $RAW_URL | awk '{split($0,a," ");print a[2]}')
+API_SERVER_IP=$(echo $API_SERVER_URL | awk '{split($0,a,":");print a[2]}'| sed 's/\/\///g')
+
+# Prepare credential and context info
+PKI_DIR=/etc/kubernetes/pki
+ROOT_CA=$PKI_DIR/ca.crt
+CLIENT_CA=$PKI_DIR/apiserver-kubelet-client.crt
+CLIENT_KEY=$PKI_DIR/apiserver-kubelet-client.key
+
+HOST_CLUSTER=fed-cluster
+HOST_USER=fed-admin
+HOST_CTX=fed-context
+
+# Unjoin the joined cluster from the federation
+for cluster_name in `kubectl --context=$federation_name get clusters | grep -v "NAME" | awk '{print $1 }'`
+do
+    echo "$passwd" | sudo -S kubefed unjoin $cluster_name --host-cluster-context=$HOST_CTX
+#    echo "$passwd" | sudo -S kubectl delete sa $cluster_name-$HOST_CTX -n federation-system
+done
+
+echo "$passwd" | sudo -S kubectl delete clusterroles federation-controller-manager:$federation_name-$HOST_CLUSTER-$HOST_CTX
+echo "$passwd" | sudo -S kubectl delete clusterrolebindings federation-controller-manager:$federation_name-$HOST_CLUSTER-$HOST_CTX
+
+
+# Delete the federation control plane
+echo "$passwd" | sudo -S kubectl delete ns/federation-system
+
+# Delete the host cluster, context and fed RBAC role
+echo "$passwd" | sudo -S kubectl config delete-cluster $HOST_CLUSTER
+echo "$passwd" | sudo -S kubectl config delete-context $HOST_CTX
+
+echo "Sleep, waiting for all federation components are terminated..."
+sleep 60 
+echo ""
+
+# Create host cluster, credential and context
+echo "$passwd" | sudo -S kubectl config set-cluster $HOST_CLUSTER --server=$API_SERVER_URL --certificate-authority=$ROOT_CA
+echo "$passwd" | sudo -S kubectl config set-credentials $HOST_USER --client-key=$CLIENT_KEY --client-certificate=$CLIENT_CA
+echo "$passwd" | sudo -S kubectl config set-context $HOST_CTX --cluster=$HOST_CLUSTER --user=$HOST_USER
+
+# Create dns provider config file 
+DNSCONFIG=$HOME/coredns-provider.conf
+if [ ! -f $DNSCONFIG ]; then
+    echo "[Global]" > $DNSCONFIG
+    echo "etcd-endpoints = http://etcd-cluster.ns:2379" >> $DNSCONFIG
+    echo "zones = $zone_name" >> $DNSCONFIG 
+fi
+
+# Start federation control plane
+echo ""
+echo "$passwd" | sudo -S kubefed init $federation_name --host-cluster-context=$HOST_CTX \
+   --dns-provider="coredns"  \
+   --dns-zone-name="$zone_name" \
+   --dns-provider-config="$DNSCONFIG"\
+   --api-server-service-type="NodePort"  \
+   --api-server-advertise-address=${API_SERVER_IP} \
+   --etcd-persistent-storage=false \
+   --image="gcr.io/google_containers/hyperkube-amd64:$version_no" 
+
+# Create default namespace in federation context
+kubectl --context=$federation_name create namespace default
+
+# Check whether federation control plane ok now
+sleep 3
+echo ""
+kubectl get pods --namespace=federation-system
+echo ""
+
+# Join federation using local cluster
+LOCAL_CTX=$HOST_CTX 
+echo "$passwd" | sudo -S kubefed --context=$federation_name join $HOST_CLUSTER --host-cluster-context=$HOST_CTX --cluster-context=$LOCAL_CTX
+
+# Check whether local cluster joined the federation now
+echo "Sleep, waiting for all federation components are started..."
+sleep 90
+echo ""
+kubectl --context=$federation_name get clusters
+
+# Label local cluster as main-cluster
+kubectl --context=$federation_name label cluster $HOST_CLUSTER type=main-cluster
+
+# Start to prepare the credential info, for other remote clusters to join
+echo ""
+echo "Start to prepare the credential info, for other remote clusters to join..."
+ 
+CONFIG=$HOME/.kube/config
+
+# Create dir to save tmp files
+TO_DIR=./join_k8s_fed
+if [ ! -d $TO_DIR ]; then
+    mkdir $TO_DIR
+fi
+
+FED_HOST_SERVER=""
+FED_CTL_SERVER=""
+FED_CTL_CA=""
+FED_CTL_CLIENT_CA=""
+FED_CTL_CLIENT_KEY=""
+
+# Parse kube config file to get info
+LINE=""
+N=0
+NUM=$(cat $CONFIG |wc -l)
+
+getline() {  N=$(expr $N + 1); LINE=$(sed -n ${N}p $CONFIG); }
+
+while [ $N -le $NUM ]
+do
+	getline
+	case $LINE in 
+	"- cluster:")
+		getline; TMP_CA="$LINE"
+		getline; TMP_SERVER="$LINE"
+		getline; TMP_NAME="$LINE"
+		NEED=$(echo $TMP_NAME |grep "$federation_name")
+		if [ -n "$NEED" ]; then
+			FED_CTL_SERVER="$TMP_SERVER"
+			FED_CTL_CA="$TMP_CA"
+		fi
+		NEED=$(echo $TMP_NAME |grep "$HOST_CLUSTER")
+		if [ -n "$NEED" ]; then
+			FED_HOST_SERVER="$TMP_SERVER"
+		fi
+		;;
+	"- name: $federation_name"*) 
+		getline #skip line user:
+		getline; FED_CTL_CLIENT_CA="$LINE"
+		getline; FED_CTL_CLIENT_KEY="$LINE"
+		;;
+	*) ;;
+	esac
+done
+
+# output result to TO_DIR
+echo $FED_CTL_CA | awk '{split($0,a," ");print a[2]}' |base64 -d > $TO_DIR/fed.ca
+echo $FED_CTL_CLIENT_CA | awk '{split($0,a," ");print a[2]}' |base64 -d > $TO_DIR/fed.crt
+echo $FED_CTL_CLIENT_KEY | awk '{split($0,a," ");print a[2]}' |base64 -d > $TO_DIR/fed.key
+
+FED_SERVER=$(echo $FED_CTL_SERVER | awk '{split($0,a," ");print a[2]}')
+HOST_SERVER=$(echo $FED_HOST_SERVER | awk '{split($0,a," ");print a[2]}')
+
+echo "$passwd" | sudo -S cp $PKI_DIR/ca.crt $TO_DIR/
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) $TO_DIR/ca.crt
+echo "$passwd" | sudo -S cp $PKI_DIR/apiserver-kubelet-client.crt $TO_DIR/
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) $TO_DIR/apiserver-kubelet-client.crt
+echo "$passwd" | sudo -S cp $PKI_DIR/apiserver-kubelet-client.key $TO_DIR/
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) $TO_DIR/apiserver-kubelet-client.key
+
+echo "#!/bin/sh" >$TO_DIR/join_fed.sh
+echo "" >>$TO_DIR/join_fed.sh
+echo "FED_URL=$FED_SERVER" >>$TO_DIR/join_fed.sh
+echo "HOST_URL=$HOST_SERVER" >>$TO_DIR/join_fed.sh
+cat ./join_fed.template >>$TO_DIR/join_fed.sh
+chmod 744 $TO_DIR/join_fed.sh
+
+if [ -f join_fed.tar ]; then
+    rm join_fed.tar 
+fi
+tar vcf join_fed.tar $TO_DIR
+rm -rf $TO_DIR
+
+echo "Done"
+echo ""

@@ -1,0 +1,71 @@
+#!/bin/bash
+# join/unjoin federation 
+
+if [ -z $5 ] ; then
+    echo "Usage: fed-join <your-passwd> <master-ip> <master-user> <master-passwd> <join-or-unjoin>"
+    exit 1
+fi
+
+passwd=$1
+masterip=$2
+masteruser=$3
+masterpasswd=$4
+joinflag=$5
+
+if [ $joinflag == "YES" ];then
+
+# Join federation
+
+if [ -f join_fed.tar ]; then
+    rm -r join_fed.tar 
+fi
+
+# Copy new images from master and Install new images
+expect -c "
+spawn scp $masteruser@$masterip:$HOME/join_fed.tar . 
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+if [ -d join_k8s_fed ]; then
+    rm -r join_k8s_fed
+fi
+
+tar xvf join_fed.tar
+cd ./join_k8s_fed
+./join_fed.sh $passwd
+
+cd ..
+rm -r ./join_k8s_fed
+rm ./join_fed.tar 
+
+else
+
+# Unjoin federation
+JOIN_CLUSTER=cluster-$(hostname)
+
+HOST_CLUSTER=fed-cluster
+HOST_CTX=fed-context
+
+FED_USER=fed
+FED_CLUSTER=fed
+FED_CONTEXT=fed
+
+FEDERATIONNAME=fellowship
+
+echo "$passwd" | sudo -S kubefed unjoin $JOIN_CLUSTER --host-cluster-context=$HOST_CONTEXT --context=$FED_CONTEXT
+
+echo "$passwd" | sudo -S kubectl config delete-cluster $HOST_CLUSTER
+echo "$passwd" | sudo -S kubectl config delete-context $HOST_CTX
+
+echo "$passwd" | sudo -S kubectl delete clusterroles federation-controller-manager:$FEDERATIONNAME-$JOIN_CLUSTER-$HOST_CTX
+echo "$passwd" | sudo -S kubectl delete clusterrolebindings federation-controller-manager:$FEDERATIONNAME-$JOIN_CLUSTER-$HOST_CTX
+
+echo "$passwd" | sudo -S kubectl delete ns/federation-system
+sleep 60
+
+fi
+

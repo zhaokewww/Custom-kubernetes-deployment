@@ -1,0 +1,231 @@
+#!/bin/bash
+# deploy k8s master components from non-build server
+
+if [ -z $6 ] ; then
+    echo "Usage: master-deploy-from-node <your-passwd> <k8s-version-no> <master-ip> <master-user> <master-passwd> <copy-build-or-not>"
+    exit 1
+fi
+
+if [ -z $K8SPATH ] ; then
+    echo "Usage: please set env K8SPATH to be your local k8s root directory"
+    exit 1
+fi
+
+passwd=$1
+version_no=$2
+masterip=$3
+masteruser=$4
+masterpasswd=$5
+copy_build=$6
+k8spath=$K8SPATH
+
+# Remove nodes
+master_node=$(hostname)
+for node_name in `kubectl get nodes | grep -v "NAME" | grep -v $master_node | awk '{print $1 }'`
+do
+    kubectl drain $node_name --delete-local-data --force --ignore-daemonsets
+    kubectl delete node $node_name
+done
+
+#Shutdown Calico and Dashboard
+kubectl delete -f http://docs.projectcalico.org/v2.1/getting-started/kubernetes/installation/hosted/kubeadm/1.6/calico.yaml
+kubectl delete -f https://rawgit.com/kubernetes/dashboard/master/src/deploy/kubernetes-dashboard.yaml
+echo "Sleep, waiting for all pods are terminated..."
+sleep 15
+
+# Shutdown K8s
+echo "$passwd" | sudo -S kubeadm reset --skip-preflight-checks
+
+# Remove images which tag is "none"
+docker ps -a | grep "Exited" | awk '{print $1 }'|xargs docker stop
+docker ps -a | grep "Exited" | awk '{print $1 }'|xargs docker rm
+docker images|grep none|awk '{print $3 }'|xargs docker rmi
+docker volume rm $(docker volume ls -qf dangling=true)
+
+# Remove old images
+docker rmi gcr.io/google_containers/kube-apiserver:$version_no
+docker rmi gcr.io/google_containers/kube-controller-manager:$version_no
+docker rmi gcr.io/google_containers/kube-proxy:$version_no
+docker rmi gcr.io/google_containers/kube-scheduler:$version_no
+docker rmi gcr.io/google_containers/kube-aggregator:$version_no
+docker rmi gcr.io/google_containers/cloud-controller-manager:$version_no
+
+docker rmi gcr.io/google_containers/kube-apiserver-amd64:$version_no
+docker rmi gcr.io/google_containers/kube-controller-manager-amd64:$version_no
+docker rmi gcr.io/google_containers/kube-proxy-amd64:$version_no
+docker rmi gcr.io/google_containers/kube-scheduler-amd64:$version_no
+docker rmi gcr.io/google_containers/kube-aggregator-amd64:$version_no
+docker rmi gcr.io/google_containers/cloud-controller-manager-amd64:$version_no
+
+dirty_version=$(docker images | grep kube-apiserver | awk '{ print $2}')
+docker rmi gcr.io/google_containers/kube-apiserver:$dirty_version
+
+dirty_version=$(docker images | grep kube-controller-manager | awk '{ print $2}')
+docker rmi gcr.io/google_containers/kube-controller-manager:$dirty_version
+
+dirty_version=$(docker images | grep kube-proxy | awk '{ print $2}')
+docker rmi gcr.io/google_containers/kube-proxy:$dirty_version
+
+dirty_version=$(docker images | grep kube-scheduler | awk '{ print $2}')
+docker rmi gcr.io/google_containers/kube-scheduler:$dirty_version
+
+dirty_version=$(docker images | grep kube-aggregator | awk '{ print $2}')
+docker rmi gcr.io/google_containers/kube-aggregator:$dirty_version
+
+dirty_version=$(docker images | grep cloud-controller-manager | awk '{ print $2}')
+docker rmi gcr.io/google_containers/cloud-controller-manager:$dirty_version
+
+# Create dir to save the copied file
+IMAGEFOLDER=./k8s-images
+if [ ! -d $IMAGEFOLDER ]; then
+    mkdir $IMAGEFOLDER 
+fi
+
+# Copy new images from master and Install new images
+cd $IMAGEFOLDER
+
+if [ $copy_build == "YES" ];then 
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubectl .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubeadm .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubefed .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubelet .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kube-apiserver.tar .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kube-controller-manager.tar .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kube-proxy.tar .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kube-scheduler.tar .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kube-aggregator.tar .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/cloud-controller-manager.tar .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+fi
+
+# Install new images
+docker load -i kube-apiserver.tar
+docker load -i kube-controller-manager.tar
+docker load -i kube-proxy.tar
+docker load -i kube-scheduler.tar
+docker load -i kube-aggregator.tar
+docker load -i cloud-controller-manager.tar
+
+docker tag gcr.io/google_containers/kube-apiserver:$(docker images | grep kube-apiserver | awk '{ print $2}') gcr.io/google_containers/kube-apiserver-amd64:$version_no
+docker tag gcr.io/google_containers/kube-controller-manager:$(docker images | grep kube-controller-manager | awk '{ print $2}') gcr.io/google_containers/kube-controller-manager-amd64:$version_no
+docker tag gcr.io/google_containers/kube-proxy:$(docker images | grep kube-proxy | awk '{ print $2}') gcr.io/google_containers/kube-proxy-amd64:$version_no
+docker tag gcr.io/google_containers/kube-scheduler:$(docker images | grep kube-scheduler | awk '{ print $2}') gcr.io/google_containers/kube-scheduler-amd64:$version_no
+docker tag gcr.io/google_containers/kube-aggregator:$(docker images | grep kube-aggregator | awk '{ print $2}') gcr.io/google_containers/kube-aggregator-amd64:$version_no
+docker tag gcr.io/google_containers/cloud-controller-manager:$(docker images | grep cloud-controller-manager | awk '{ print $2}') gcr.io/google_containers/cloud-controller-manager-amd64:$version_no
+
+echo "$passwd" | sudo -S cp kubectl kubeadm kubelet kubefed /usr/local/bin
+cd ..
+
+# Start K8s
+echo "$passwd" | sudo -S systemctl daemon-reload
+echo "$passwd" | sudo -S systemctl start kubelet
+
+echo "$passwd" | sudo -S kubeadm init --kubernetes-version $version_no --skip-preflight-checks --token=a9d0cf.ba7ada900f39d9d2 --token-ttl 0
+
+# Config Kube client
+rm -r $HOME/.kube
+mkdir -p $HOME/.kube
+echo "$passwd" | sudo -S cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Config Kube client for root
+echo "$passwd" | sudo -S rm -r /root/.kube
+echo "$passwd" | sudo -S mkdir -p /root/.kube
+echo "$passwd" | sudo -S cp -i /etc/kubernetes/admin.conf /root/.kube/config
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) /root/.kube/config
+
+# Prepare admin.conf for nodes
+
+# Untaint master
+kubectl taint nodes --all node-role.kubernetes.io/master-
+
+# Start Calico
+kubectl apply -f http://docs.projectcalico.org/v2.1/getting-started/kubernetes/installation/hosted/kubeadm/1.6/calico.yaml
+
+# Start Dashboard
+kubectl create -f https://rawgit.com/kubernetes/dashboard/master/src/deploy/kubernetes-dashboard.yaml
+
+# Check whether we are ok now
+echo "Sleep, waiting for all system pods are started..."
+sleep 90
+kubectl get pods -n kube-system

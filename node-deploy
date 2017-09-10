@@ -1,0 +1,117 @@
+#!/bin/bash
+# deploy k8s node components
+
+if [ -z $5 ] ; then
+    echo "Usage: ./node-deploy <your-passwd> <k8s-version-no> <master-ip> <master-user> <master-passwd>"
+    exit 1
+fi
+
+if [ -z $K8SPATH ] ; then
+    echo "Usage: please set env K8SPATH to be your master node's k8s source code root directory"
+    exit 1
+fi
+
+passwd=$1
+version_no=$2
+masterip=$3
+masteruser=$4
+masterpasswd=$5
+k8spath=$K8SPATH
+
+# Disjoin from Master 
+echo "$passwd" | sudo -S kubeadm reset --skip-preflight-checks
+
+# Remove images which tag is "none"
+#docker ps -a | grep "Exited" | awk '{print $1 }'|xargs docker stop
+#docker ps -a | grep "Exited" | awk '{print $1 }'|xargs docker rm
+#docker images|grep none|awk '{print $3 }'|xargs docker rmi
+
+# Remove old images
+docker rmi gcr.io/google_containers/kube-proxy:$version_no
+docker rmi gcr.io/google_containers/kube-proxy-amd64:$version_no
+dirty_version=$(docker images | grep kube-proxy | awk '{ print $2}')
+docker rmi gcr.io/google_containers/kube-proxy:$dirty_version 
+
+# Copy new images from master and Install new images
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kube-proxy.tar . 
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubectl . 
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubeadm .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubefed .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+expect -c "
+spawn scp $masteruser@$masterip:$k8spath/_output/release-tars/kubernetes/server/bin/kubelet .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+
+docker load -i kube-proxy.tar
+docker tag gcr.io/google_containers/kube-proxy:$(docker images | grep kube-proxy | awk '{ print $2}') gcr.io/google_containers/kube-proxy-amd64:$version_no
+
+echo "$passwd" | sudo -S mv kubectl kubeadm kubelet kubefed /usr/local/bin 
+
+# Config kube client
+rm admin.conf
+expect -c "
+spawn scp $masteruser@$masterip:/home/$masteruser/admin.conf .
+expect {
+\"*assword\" {set timeout 300; send \"$masterpasswd\r\";}
+\"yes/no\" {send \"yes\r\"; exp_continue;}
+}
+expect eof
+"
+rm -r $HOME/.kube
+mkdir -p $HOME/.kube
+echo "$passwd" | sudo -S cp -i admin.conf $HOME/.kube/config
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Config Kube client for root
+echo "$passwd" | sudo -S rm -r /root/.kube
+echo "$passwd" | sudo -S mkdir -p /root/.kube
+echo "$passwd" | sudo -S cp -i admin.conf /root/.kube/config
+echo "$passwd" | sudo -S chown $(id -u):$(id -g) /root/.kube/config
+
+# Start K8s on node
+echo "$passwd" | sudo -S systemctl daemon-reload
+echo "$passwd" | sudo -S systemctl start kubelet
+
+# Join K8s master
+echo "$passwd" | sudo -S sudo kubeadm join --skip-preflight-checks --token a9d0cf.ba7ada900f39d9d2 $masterip:6443
+
+# Check whether we are ok now
+echo "Sleep, waiting for all node components are started..."
+sleep 50 
+kubectl get nodes 

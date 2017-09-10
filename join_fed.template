@@ -1,0 +1,86 @@
+
+passwd=$1
+
+#The cluster name which displayed in federation
+JOIN_CLUSTER=cluster-$(hostname)
+
+#local cluster info
+CA_PATH=/etc/kubernetes/pki
+
+# parse kube config file to get info
+CONFIG=$HOME/.kube/config
+
+RAW_URL=""
+LINE=""
+N=0
+NUM=$(cat $CONFIG |wc -l)
+getline() {  N=$(expr $N + 1); LINE=$(sed -n ${N}p $CONFIG); }
+while [ $N -le $NUM ]
+do
+	getline
+	case $LINE in 
+	"- cluster:")
+		getline; TMP_CA="$LINE"
+		getline; TMP_SERVER="$LINE"
+		getline; TMP_NAME="$LINE"
+		NEED=$(echo $TMP_NAME |grep "kubernetes")
+		if [ -n "$NEED" ]; then
+			RAW_URL="$TMP_SERVER"
+		fi
+		;;
+	*) ;;
+	esac
+done
+
+LOCAL_SERVER=$(echo $RAW_URL | awk '{split($0,a," ");print a[2]}')
+echo "LOCAL_SERVER=$LOCAL_SERVER"
+LOCAL_USER=kubernetes-admin
+LOCAL_CLUSTER=kubernetes
+LOCAL_CONTEXT=kubernetes-admin@kubernetes
+LOCAL_ROOT_CA=$CA_PATH/ca.crt
+LOCAL_CLIENT_CA=$CA_PATH/apiserver-kubelet-client.crt
+LOCAL_CLIENT_KEY=$CA_PATH/apiserver-kubelet-client.key
+
+#folder to store CA files from remote federation control plan and host cluster
+FED_CA_PATH=$CA_PATH/fed
+
+#remote federation control plane info
+FED_SERVER=$FED_URL
+FED_USER=fed
+FED_CLUSTER=fed
+FED_CONTEXT=fed
+FED_ROOT_CA=$FED_CA_PATH/fed.ca
+FED_CLIENT_CA=$FED_CA_PATH/fed.crt
+FED_CLIENT_KEY=$FED_CA_PATH/fed.key
+
+#remote cluster which host the federation control plane
+HOST_SERVER=$HOST_URL
+HOST_USER=fed-admin
+HOST_CLUSTER=fed-cluster
+HOST_CONTEXT=fed-context
+HOST_ROOT_CA=$FED_CA_PATH/ca.crt
+HOST_CLIENT_CA=$FED_CA_PATH/apiserver-kubelet-client.crt
+HOST_CLIENT_KEY=$FED_CA_PATH/apiserver-kubelet-client.key
+
+#copy the federation join needed CA files
+if [ ! -d "$FED_CA_PATH" ]; then
+    echo "$passwd" | sudo -S mkdir $FED_CA_PATH
+fi
+
+echo "$passwd" | sudo -S cp ./* $FED_CA_PATH/
+
+#set cluster, context and credentials
+echo "set kube config"
+kubectl config set-cluster $FED_CLUSTER --server=$FED_SERVER --certificate-authority=$FED_ROOT_CA
+kubectl config set-credentials $FED_USER --client-key=$FED_CLIENT_KEY --client-certificate=$FED_CLIENT_CA
+kubectl config set-context $FED_CONTEXT --cluster=$FED_CLUSTER --user=$FED_USER
+
+kubectl config set-cluster $HOST_CLUSTER --server=$HOST_SERVER --certificate-authority=$HOST_ROOT_CA
+kubectl config set-credentials $HOST_USER --client-key=$HOST_CLIENT_KEY --client-certificate=$HOST_CLIENT_CA
+kubectl config set-context $HOST_CONTEXT --cluster=$HOST_CLUSTER --user=$HOST_USER
+
+echo ""
+echo "$passwd" | sudo -S kubefed --context=$FED_CONTEXT join $JOIN_CLUSTER --host-cluster-context=$HOST_CONTEXT --cluster-context=$LOCAL_CONTEXT
+echo "join cluster $JOIN_CLUSTER to federation..."
+sleep 30
+kubectl --context=$FED_CONTEXT get clusters
